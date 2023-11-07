@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright IBM Corp. 2016
+ * Copyright IBM Corp. 2016, 2023
  * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
  *
  * Adjunct processor bus, queue related code.
@@ -31,6 +31,11 @@ static inline bool ap_q_supports_bind(struct ap_queue *aq)
 static inline bool ap_q_supports_assoc(struct ap_queue *aq)
 {
 	return ap_test_bit(&aq->card->functions, AP_FUNC_EP11);
+}
+
+static inline bool ap_q_needs_bind(struct ap_queue *aq)
+{
+	return ap_q_supports_bind(aq) && ap_sb_available();
 }
 
 /**
@@ -92,51 +97,6 @@ __ap_send(ap_qid_t qid, unsigned long psmid, void *msg, size_t msglen,
 		qid |= 0x400000UL;
 	return ap_nqap(qid, psmid, msg, msglen);
 }
-
-int ap_send(ap_qid_t qid, unsigned long psmid, void *msg, size_t msglen)
-{
-	struct ap_queue_status status;
-
-	status = __ap_send(qid, psmid, msg, msglen, 0);
-	if (status.async)
-		return -EPERM;
-	switch (status.response_code) {
-	case AP_RESPONSE_NORMAL:
-		return 0;
-	case AP_RESPONSE_Q_FULL:
-	case AP_RESPONSE_RESET_IN_PROGRESS:
-		return -EBUSY;
-	case AP_RESPONSE_REQ_FAC_NOT_INST:
-		return -EINVAL;
-	default:	/* Device is gone. */
-		return -ENODEV;
-	}
-}
-EXPORT_SYMBOL(ap_send);
-
-int ap_recv(ap_qid_t qid, unsigned long *psmid, void *msg, size_t msglen)
-{
-	struct ap_queue_status status;
-
-	if (!msg)
-		return -EINVAL;
-	status = ap_dqap(qid, psmid, msg, msglen, NULL, NULL, NULL);
-	if (status.async)
-		return -EPERM;
-	switch (status.response_code) {
-	case AP_RESPONSE_NORMAL:
-		return 0;
-	case AP_RESPONSE_NO_PENDING_REPLY:
-		if (status.queue_empty)
-			return -ENOENT;
-		return -EBUSY;
-	case AP_RESPONSE_RESET_IN_PROGRESS:
-		return -EBUSY;
-	default:
-		return -ENODEV;
-	}
-}
-EXPORT_SYMBOL(ap_recv);
 
 /* State machine definitions and helpers */
 
@@ -349,6 +309,7 @@ static enum ap_sm_wait ap_sm_reset(struct ap_queue *aq)
 		aq->sm_state = AP_SM_STATE_RESET_WAIT;
 		aq->interrupt = false;
 		aq->rapq_fbit = 0;
+		aq->se_bound = false;
 		return AP_SM_WAIT_LOW_TIMEOUT;
 	default:
 		aq->dev_state = AP_DEV_STATE_ERROR;
@@ -913,7 +874,12 @@ static ssize_t se_bind_store(struct device *dev,
 		}
 		status = ap_bapq(aq->qid);
 		spin_unlock_bh(&aq->lock);
-		if (status.response_code) {
+		if (!status.response_code) {
+			aq->se_bound = true;
+			AP_DBF_INFO("%s bapq(0x%02x.%04x) success\n", __func__,
+				    AP_QID_CARD(aq->qid),
+				    AP_QID_QUEUE(aq->qid));
+		} else {
 			AP_DBF_WARN("%s RC 0x%02x on bapq(0x%02x.%04x)\n",
 				    __func__, status.response_code,
 				    AP_QID_CARD(aq->qid),
@@ -1119,6 +1085,42 @@ int ap_queue_message(struct ap_queue *aq, struct ap_message *ap_msg)
 EXPORT_SYMBOL(ap_queue_message);
 
 /**
+ * ap_queue_usable(): Check if queue is usable just now.
+ * @aq: The AP queue device to test for usability.
+ * This function is intended for the scheduler to query if it makes
+ * sense to enqueue a message into this AP queue device by calling
+ * ap_queue_message(). The perspective is very short-term as the
+ * state machine and device state(s) may change at any time.
+ */
+bool ap_queue_usable(struct ap_queue *aq)
+{
+	bool rc = true;
+
+	spin_lock_bh(&aq->lock);
+
+	/* check for not configured or checkstopped */
+	if (!aq->config || aq->chkstop) {
+		rc = false;
+		goto unlock_and_out;
+	}
+
+	/* device state needs to be ok */
+	if (aq->dev_state != AP_DEV_STATE_OPERATING) {
+		rc = false;
+		goto unlock_and_out;
+	}
+
+	/* SE guest's queues additionally need to be bound */
+	if (ap_q_needs_bind(aq) && !aq->se_bound)
+		rc = false;
+
+unlock_and_out:
+	spin_unlock_bh(&aq->lock);
+	return rc;
+}
+EXPORT_SYMBOL(ap_queue_usable);
+
+/**
  * ap_cancel_message(): Cancel a crypto request.
  * @aq: The AP device that has the message queued
  * @ap_msg: The message that is to be removed
@@ -1205,14 +1207,19 @@ void ap_queue_remove(struct ap_queue *aq)
 	spin_unlock_bh(&aq->lock);
 }
 
-void ap_queue_init_state(struct ap_queue *aq)
+void _ap_queue_init_state(struct ap_queue *aq)
 {
-	spin_lock_bh(&aq->lock);
 	aq->dev_state = AP_DEV_STATE_OPERATING;
 	aq->sm_state = AP_SM_STATE_RESET_START;
 	aq->last_err_rc = 0;
 	aq->assoc_idx = ASSOC_IDX_INVALID;
 	ap_wait(ap_sm_event(aq, AP_SM_EVENT_POLL));
+}
+
+void ap_queue_init_state(struct ap_queue *aq)
+{
+	spin_lock_bh(&aq->lock);
+	_ap_queue_init_state(aq);
 	spin_unlock_bh(&aq->lock);
 }
 EXPORT_SYMBOL(ap_queue_init_state);
